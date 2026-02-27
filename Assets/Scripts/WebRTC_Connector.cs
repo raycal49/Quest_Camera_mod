@@ -28,6 +28,8 @@ public class WebRTCSender : MonoBehaviour
     private RenderTexture _webRtcRenderTexture;
     private Material _stereoBlendMaterial;
 
+    private string callerName = "Meta Quest User";
+
 
     private RTCPeerConnection peerConnection;
     private VideoStreamTrack videoTrack;
@@ -36,16 +38,23 @@ public class WebRTCSender : MonoBehaviour
     
 
     private string signalingServerUrl = "https://ar-signaling-server.azurewebsites.net";
-    private string userId = "quest-user";
-    private string room = "default-room";
+    private string userId;
+    private string room;
 
     private ClientWebSocket ws;
     private CancellationTokenSource cts;
     private readonly Queue<string> messageQueue = new Queue<string>();
 
+    void Awake()
+    {
+        // Generate a unique ID for this Quest session.
+        // Using a short random suffix keeps logs readable.
+        string suffix = Guid.NewGuid().ToString("N").Substring(0, 6);
+        userId = $"quest-{suffix}";
+        room   = $"quest-{suffix}"; // private room = same as userId for clarity
+    }
     void Start()
     {
-        //Debug.Log("WebRTC: Start() called");
         StartCoroutine(WebRTC.Update());
         StartCoroutine(RequestPermissionThenInit());
     }
@@ -84,8 +93,8 @@ public class WebRTCSender : MonoBehaviour
 
     IEnumerator Initialize()
     {
-        //Debug.Log("WebRTC: Initialize() started");
-        // 1. Fetch ICE config
+        Debug.Log($"WebRTC: Initializing as userId={userId}, room={room}");
+        
         using var iceReq = UnityWebRequest.Get($"{signalingServerUrl}/ice-config");
         yield return iceReq.SendWebRequest();
 
@@ -94,7 +103,6 @@ public class WebRTCSender : MonoBehaviour
             //Debug.LogError("ICE config failed: " + iceReq.error);
             yield break;
         }
-        //Debug.Log("WebRTC: Initialize() started");
 
         var iceConfig = JsonUtility.FromJson<IceConfigResponse>(iceReq.downloadHandler.text);
 
@@ -108,7 +116,6 @@ public class WebRTCSender : MonoBehaviour
             Debug.LogError("Negotiate failed: " + negReq.error);
             yield break;
         }
-        //Debug.Log("WebRTC: Negotiate OK");
 
         var negotiateResponse = JsonUtility.FromJson<NegotiateResponse>(negReq.downloadHandler.text);
 
@@ -240,10 +247,11 @@ public class WebRTCSender : MonoBehaviour
         // Send call request
         SendWs(new {
             type = "sendToGroup",
-            group = room,
+            group = "lobby",
             dataType = "json",
-            data = new { type = "call-request", room, callerName = "Meta Quest User" }
+            data = new { type = "call-request", room, callerName }
         });
+        Debug.Log($"WebRTC: Call request sent to lobby for room={room}");
 
         // Start receiving
         await ReceiveLoop();
@@ -287,11 +295,20 @@ public class WebRTCSender : MonoBehaviour
         if (!data.ContainsKey("type")) return;
         var type = data["type"].ToString();
 
+        // Only process messages intended for our room
+        if (data.ContainsKey("room") && data["room"]?.ToString() != room)
+            return;
+
         switch (type)
         {
             case "call-accepted":
                 Debug.Log("Call accepted — sending offer");
                 StartCoroutine(SendOffer());
+                break;
+
+            case "call-declined":
+                Debug.Log("WebRTC: Call declined by web client");
+                // Optionally: re-broadcast to lobby after a delay so other web clients can answer
                 break;
 
             case "answer":
@@ -380,7 +397,20 @@ public class WebRTCSender : MonoBehaviour
         };
 
         peerConnection.OnIceConnectionChange = state => Debug.Log($"WebRTC ICE: {state}");
-        peerConnection.OnConnectionStateChange = state => Debug.Log($"WebRTC Connection: {state}");
+        peerConnection.OnConnectionStateChange = state =>
+        {
+            Debug.Log($"WebRTC Connection: {state}");
+            if (state == RTCPeerConnectionState.Disconnected || state == RTCPeerConnectionState.Failed)
+            {
+                // Notify lobby that this call ended so web clients can clean up
+                SendWs(new {
+                    type     = "sendToGroup",
+                    group    = "lobby",
+                    dataType = "json",
+                    data     = new { type = "call-ended", room }
+                });
+            }
+        };
 
     }
 
@@ -428,6 +458,17 @@ public class WebRTCSender : MonoBehaviour
 
     void OnDestroy()
     {
+        // Notifying lobby that call is ended
+        if (ws != null && ws.State == WebSocketState.Open)
+        {
+            SendWs(new {
+                type     = "sendToGroup",
+                group    = "lobby",
+                dataType = "json",
+                data     = new { type = "call-ended", room }
+            });
+        }
+
         cts?.Cancel();
         videoTrack?.Dispose();
         peerConnection?.Close();
@@ -438,7 +479,6 @@ public class WebRTCSender : MonoBehaviour
     }
 }
 
-// ── Data classes ──────────────────────────────────────────────────────────────
 [Serializable] class NegotiateResponse { public string url; }
 [Serializable] class IceConfigResponse { public IceServerData[] iceServers; }
 [Serializable] class IceServerData { public string[] urls; public string username; public string credential; }
