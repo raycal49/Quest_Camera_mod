@@ -1,16 +1,19 @@
+using Meta.XR;
+using System;
 using System.Collections;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Net.WebSockets;
+using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Unity.WebRTC;
 using UnityEngine;
-using UnityEngine.Networking;
-using System;
-using System.Collections.Generic;
-using System.Text;
 using UnityEngine.Android;
-using Meta.XR;
 using UnityEngine.Experimental.Rendering;
+using UnityEngine.Networking;
+using Newtonsoft.Json;
 
 public class WebRTCSender : MonoBehaviour
 {
@@ -30,20 +33,19 @@ public class WebRTCSender : MonoBehaviour
 
     private string callerName = "Meta Quest User";
 
-
     private RTCPeerConnection peerConnection;
     private VideoStreamTrack videoTrack;
     private bool _trackReady = false;
 
-    
-
-    private string signalingServerUrl = "https://ar-signaling-server.azurewebsites.net";
-    private string userId;
+    //private string signalingServerUrl = "https://ar-signaling-server.azurewebsites.net";
+    private SignalServer server = new SignalServer("https://ar-signaling-server.azurewebsites.net");
+    private string userId = "quest-user";
     private string room;
 
-    private ClientWebSocket ws;
-    private CancellationTokenSource cts;
-    private readonly Queue<string> messageQueue = new Queue<string>();
+    //private ClientWebSocket ws;
+    public Socket socket = new Socket();
+    private CancellationTokenSource cts = new CancellationTokenSource();
+    private readonly ConcurrentQueue<string> messageQueue = new ConcurrentQueue<string>();
 
     void Awake()
     {
@@ -51,20 +53,21 @@ public class WebRTCSender : MonoBehaviour
         // Using a short random suffix keeps logs readable.
         string suffix = Guid.NewGuid().ToString("N").Substring(0, 6);
         userId = $"quest-{suffix}";
-        room   = $"quest-{suffix}"; // private room = same as userId for clarity
+        room = $"quest-{suffix}"; // private room = same as userId for clarity
     }
+
     void Start()
     {
+        Debug.Log("WebRTC: Start() called");
         StartCoroutine(WebRTC.Update());
         StartCoroutine(RequestPermissionThenInit());
     }
 
     void Update()
     {
-        lock (messageQueue)
+        while (messageQueue.TryDequeue(out string message))
         {
-            while (messageQueue.Count > 0)
-                HandleMessage(messageQueue.Dequeue());
+            HandleMessage(message);
         }
     }
 
@@ -94,78 +97,70 @@ public class WebRTCSender : MonoBehaviour
     IEnumerator Initialize()
     {
         Debug.Log($"WebRTC: Initializing as userId={userId}, room={room}");
-        
-        using var iceReq = UnityWebRequest.Get($"{signalingServerUrl}/ice-config");
-        yield return iceReq.SendWebRequest();
 
-        if (iceReq.result != UnityWebRequest.Result.Success)
-        {
-            //Debug.LogError("ICE config failed: " + iceReq.error);
+        yield return server.GetIceConfig();
+
+        var iceConfig = server.IceConfig;
+
+        if (iceConfig == null)
             yield break;
-        }
 
-        var iceConfig = JsonUtility.FromJson<IceConfigResponse>(iceReq.downloadHandler.text);
+        Debug.Log("WebRTC: Ice config set");
 
-        // 2. Negotiate Web PubSub token
-        using var negReq = UnityWebRequest.Get(
-            $"{signalingServerUrl}/negotiate?userId={userId}&room={room}");
-        yield return negReq.SendWebRequest();
+        yield return server.GetNegotiateUrl(userId, room);
 
-        if (negReq.result != UnityWebRequest.Result.Success)
-        {
-            Debug.LogError("Negotiate failed: " + negReq.error);
+        var negotiateUrl = server.NegotiateUrl;
+
+        if (negotiateUrl == null)
             yield break;
-        }
 
-        var negotiateResponse = JsonUtility.FromJson<NegotiateResponse>(negReq.downloadHandler.text);
+        Debug.Log("WebRTC: Negotiate OK");
 
-        // 3. Setup WebRTC
         SetupPeerConnection(iceConfig);
 
         yield return StartCoroutine(SetupVideoTrack());
 
         // 4. Connect WebSocket
-        cts = new CancellationTokenSource();
-        _ = ConnectWebSocket(negotiateResponse.url);
+        yield return ConnectWebSocket(negotiateUrl);
     }
 
     IEnumerator SetupVideoTrack()
     {
-      // Wait until PassthroughCameraAccess is actually playing and has a frame
-      float timeout = 10f;
-      float elapsed = 0f;
-      while ((!passthroughLeft.IsPlaying || !passthroughRight.IsPlaying) && elapsed < timeout)
-      {
-          yield return new WaitForSeconds(0.2f);
-          elapsed += 0.2f;
-      }
+        // Wait until PassthroughCameraAccess is actually playing and has a frame
+        float timeout = 10f;
+        float elapsed = 0f;
+        while ((!passthroughLeft.IsPlaying || !passthroughRight.IsPlaying) && elapsed < timeout)
+        {
+            yield return new WaitForSeconds(0.2f);
+            elapsed += 0.2f;
+        }
 
-      if (!passthroughLeft.IsPlaying || !passthroughRight.IsPlaying)
-      {
-          //Debug.LogError("WebRTC: PassthroughCameraAccess never started playing!");
-          yield break;
-      }
+        if (!passthroughLeft.IsPlaying || !passthroughRight.IsPlaying)
+        {
+            //Debug.LogError("WebRTC: PassthroughCameraAccess never started playing!");
+            yield break;
+        }
 
-      yield return new WaitForEndOfFrame();
-      yield return new WaitForEndOfFrame();
+        yield return new WaitForEndOfFrame();
+        yield return new WaitForEndOfFrame();
 
-      var sourceRt = passthroughLeft.GetTexture() as RenderTexture;
-      if (sourceRt == null)
-      {
-          //Debug.LogError("WebRTC: Could not get RenderTexture from PassthroughCameraAccess!");
-          yield break;
-      }
-      _webRtcRenderTexture = new RenderTexture(sourceRt.width, sourceRt.height, 0)
-      {
-          useMipMap = false,
-          autoGenerateMips = false,
-          graphicsFormat = GraphicsFormat.B8G8R8A8_SRGB
-      };
-      _webRtcRenderTexture.Create();
+        var sourceRt = passthroughLeft.GetTexture() as RenderTexture;
+        if (sourceRt == null)
+        {
+            //Debug.LogError("WebRTC: Could not get RenderTexture from PassthroughCameraAccess!");
+            yield break;
+        }
+        _webRtcRenderTexture = new RenderTexture(sourceRt.width, sourceRt.height, 0)
+        {
+            useMipMap = false,
+            autoGenerateMips = false,
+            graphicsFormat = GraphicsFormat.B8G8R8A8_SRGB
+        };
+        _webRtcRenderTexture.Create();
 
-      AlignCaptureCamerasToLens();
+        AlignCaptureCamerasToLens();
 
-      var shader = Shader.Find("Custom/StereoBlend");
+        var shader = Shader.Find("Custom/StereoBlend");
         if (shader == null)
         {
             //Debug.LogError("WebRTC: Could not find shader Custom/StereoBlend!");
@@ -173,13 +168,13 @@ public class WebRTCSender : MonoBehaviour
         }
         _stereoBlendMaterial = new Material(shader);
 
-      videoTrack = new VideoStreamTrack(_webRtcRenderTexture);
-      peerConnection.AddTrack(videoTrack);
+        videoTrack = new VideoStreamTrack(_webRtcRenderTexture);
+        peerConnection.AddTrack(videoTrack);
 
-      _trackReady = true;
-      StartCoroutine(CompositorLoop());
+        _trackReady = true;
+        StartCoroutine(CompositorLoop());
 
-      //Debug.Log("WebRTC: Track created, starting loop");
+        //Debug.Log("WebRTC: Track created, starting loop");
     }
 
     IEnumerator CompositorLoop()
@@ -190,106 +185,87 @@ public class WebRTCSender : MonoBehaviour
             yield return new WaitForEndOfFrame();
 
             if (!_trackReady || _webRtcRenderTexture == null) continue;
-            if (!passthroughLeft.IsPlaying || !passthroughRight.IsPlaying) {
-            //Debug.Log($"WebRTC: Passthrough not playing — left={passthroughLeft.IsPlaying}, right={passthroughRight.IsPlaying}");
-            continue;
+            if (!passthroughLeft.IsPlaying || !passthroughRight.IsPlaying)
+            {
+                //Debug.Log($"WebRTC: Passthrough not playing — left={passthroughLeft.IsPlaying}, right={passthroughRight.IsPlaying}");
+                continue;
             }
 
-            var leftSrc  = passthroughLeft.GetTexture();
+            var leftSrc = passthroughLeft.GetTexture();
             var rightSrc = passthroughRight.GetTexture();
             if (leftSrc == null || rightSrc == null) continue;
 
-            _stereoBlendMaterial.SetTexture("_LeftTex",     leftSrc);
-            _stereoBlendMaterial.SetTexture("_RightTex",    rightSrc);
-            _stereoBlendMaterial.SetTexture("_LeftAssets",  LeftCameraRT);
+            _stereoBlendMaterial.SetTexture("_LeftTex", leftSrc);
+            _stereoBlendMaterial.SetTexture("_RightTex", rightSrc);
+            _stereoBlendMaterial.SetTexture("_LeftAssets", LeftCameraRT);
             _stereoBlendMaterial.SetTexture("_RightAssets", RightCameraRT);
 
             Graphics.Blit(null, _webRtcRenderTexture, _stereoBlendMaterial);
             //Debug.Log("WebRTC: Blit complete");
         }
     }
+
     void AlignCaptureCamerasToLens()
     {
         // Use the physical lens offsets from the SDK so Unity cameras
         // precisely match the real-world passthrough camera positions
-        var leftLens  = passthroughLeft.Intrinsics.LensOffset;
+        var leftLens = passthroughLeft.Intrinsics.LensOffset;
         var rightLens = passthroughRight.Intrinsics.LensOffset;
 
-        LeftCaptureCamera.transform.localPosition  = leftLens.position;
-        LeftCaptureCamera.transform.localRotation  = leftLens.rotation;
+        LeftCaptureCamera.transform.localPosition = leftLens.position;
+        LeftCaptureCamera.transform.localRotation = leftLens.rotation;
         RightCaptureCamera.transform.localPosition = rightLens.position;
         RightCaptureCamera.transform.localRotation = rightLens.rotation;
 
         // Derive vertical FOV from the camera intrinsics
-        float fovLeft  = 2f * Mathf.Atan(passthroughLeft.CurrentResolution.y  / (2f * passthroughLeft.Intrinsics.FocalLength.y))  * Mathf.Rad2Deg;
+        float fovLeft = 2f * Mathf.Atan(passthroughLeft.CurrentResolution.y / (2f * passthroughLeft.Intrinsics.FocalLength.y)) * Mathf.Rad2Deg;
         float fovRight = 2f * Mathf.Atan(passthroughRight.CurrentResolution.y / (2f * passthroughRight.Intrinsics.FocalLength.y)) * Mathf.Rad2Deg;
 
-        LeftCaptureCamera.fieldOfView  = fovLeft;
+        LeftCaptureCamera.fieldOfView = fovLeft;
         RightCaptureCamera.fieldOfView = fovRight;
     }
 
+    // need to put this in its own controller
     async Task ConnectWebSocket(string url)
     {
-        ws = new ClientWebSocket();
-        ws.Options.AddSubProtocol("json.webpubsub.azure.v1");
+        socket.SetUrl(url);
 
-        await ws.ConnectAsync(new Uri(url), cts.Token);
-        //Debug.Log("Connected to Web PubSub");
+        await socket.ConnectWebSocket(url);
+        Debug.Log("Connected to Web PubSub");
+
+        var joinGroup = new JoinGroupMessage { Group = room };
 
         // Join room
-        SendWs(new {
-            type = "joinGroup",
-            group = room
-        });
+        await socket.Send(joinGroup);
 
         await Task.Delay(2000);
 
         // Send call request
-        SendWs(new {
-            type = "sendToGroup",
-            group = "lobby",
-            dataType = "json",
-            data = new { type = "call-request", room, callerName }
-        });
-        Debug.Log($"WebRTC: Call request sent to lobby for room={room}");
+        var sendGroup = new SendToGroupMessage<CallRequestData>
+        {
+            Group = room,
+            Data = new CallRequestData
+            {
+                Group = room,
+                CallerName = callerName 
+                
+            }
+        };
+
+        await socket.Send(sendGroup);
 
         // Start receiving
-        await ReceiveLoop();
-    }
-
-    async Task ReceiveLoop()
-    {
-        var buffer = new byte[8192];
-        while (ws.State == WebSocketState.Open)
-        {
-            var sb = new StringBuilder();
-            WebSocketReceiveResult result;
-            do
-            {
-                result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), cts.Token);
-                sb.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
-            } while (!result.EndOfMessage);
-
-            lock (messageQueue)
-                messageQueue.Enqueue(sb.ToString());
-        }
-    }
-
-    void SendWs(object data)
-    {
-        var json = Newtonsoft.Json.JsonConvert.SerializeObject(data);
-        var bytes = Encoding.UTF8.GetBytes(json);
-        _ = ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, cts.Token);
+        await socket.ReceiveLoop(messageQueue);
     }
 
     void HandleMessage(string raw)
     {
-        //Debug.Log("WebRTC WS <- " + raw);
+        Debug.Log("WebRTC WS <- " + raw);
 
-        var msg = Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<string, object>>(raw);
+        var msg = JsonConvert.DeserializeObject<Dictionary<string, object>>(raw);
         if (!msg.ContainsKey("data")) return;
 
-        var data = Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<string, object>>(
+        var data = JsonConvert.DeserializeObject<Dictionary<string, object>>(
             msg["data"].ToString());
 
         if (!data.ContainsKey("type")) return;
@@ -330,7 +306,7 @@ public class WebRTCSender : MonoBehaviour
             var candidateRaw = data["candidate"];
             if (candidateRaw == null) return;
 
-            var candidateObj = Newtonsoft.Json.JsonConvert
+            var candidateObj = JsonConvert
                 .DeserializeObject<Dictionary<string, object>>(candidateRaw.ToString());
 
             if (candidateObj == null) return;
@@ -340,7 +316,7 @@ public class WebRTCSender : MonoBehaviour
             // Empty candidate = end-of-candidates signal, safe to ignore
             if (string.IsNullOrEmpty(candidateStr)) 
             {
-                //Debug.Log("WebRTC: End of candidates signal received, ignoring.");
+                Debug.Log("WebRTC: End of candidates signal received, ignoring.");
                 return;
             }
 
@@ -355,7 +331,7 @@ public class WebRTCSender : MonoBehaviour
                 sdpMLineIndex = sdpMLineIndex
             };
             peerConnection.AddIceCandidate(new RTCIceCandidate(init));
-            //Debug.Log("WebRTC: ICE candidate added");
+            Debug.Log("WebRTC: ICE candidate added");
         }
         catch (Exception e)
         {
@@ -363,37 +339,42 @@ public class WebRTCSender : MonoBehaviour
         }
     }
 
-    void SetupPeerConnection(IceConfigResponse iceConfig)
+    // this is only initialized AFTER we have an IceConfig file
+    void SetupPeerConnection(IceConfig iceConfig)
     {
         var iceServers = new List<RTCIceServer>();
-        foreach (var s in iceConfig.iceServers)
+        foreach (var s in iceConfig.IceServers)
             iceServers.Add(new RTCIceServer
             {
-                urls = s.urls,
-                username = s.username,
-                credential = s.credential
+                urls = s.Urls,
+                username = s.Username,
+                credential = s.Credential
             });
 
         var config = new RTCConfiguration { iceServers = iceServers.ToArray() };
+
         peerConnection = new RTCPeerConnection(ref config);
 
         peerConnection.OnIceCandidate = candidate =>
         {
             if (string.IsNullOrEmpty(candidate.Candidate)) return;
-            SendWs(new {
-                type = "sendToGroup",
-                group = room,
-                dataType = "json",
-                data = new {
-                    type = "ice-candidate",
-                    room,
-                    candidate = new {
-                        candidate = candidate.Candidate,
-                        sdpMid = candidate.SdpMid,
-                        sdpMLineIndex = candidate.SdpMLineIndex ?? 0
+
+            var message = new SendToGroupMessage<IceCandidateRequestData>
+            {
+                Group = room,
+                Data = new IceCandidateRequestData
+                {
+                    Group = room,
+                    Candidate = new IceCandidatePayload
+                    {
+                        Candidate = candidate.Candidate,
+                        SdpMid = candidate.SdpMid,
+                        SdpMLineIndex = candidate.SdpMLineIndex ?? 0
                     }
                 }
-            });
+            };
+
+            socket.Send(message);
         };
 
         peerConnection.OnIceConnectionChange = state => Debug.Log($"WebRTC ICE: {state}");
@@ -402,16 +383,18 @@ public class WebRTCSender : MonoBehaviour
             Debug.Log($"WebRTC Connection: {state}");
             if (state == RTCPeerConnectionState.Disconnected || state == RTCPeerConnectionState.Failed)
             {
-                // Notify lobby that this call ended so web clients can clean up
-                SendWs(new {
-                    type     = "sendToGroup",
-                    group    = "lobby",
-                    dataType = "json",
-                    data     = new { type = "call-ended", room }
+                socket.Send(new SendToGroupMessage<CallEndedData>
+                {
+                    Group = "lobby",
+                    Data = new CallEndedData
+                    {
+                        Group = room
+                    }
                 });
             }
         };
 
+        Debug.Log("WebRTC: Peer connection created");
     }
 
     IEnumerator SendOffer()
@@ -426,7 +409,7 @@ public class WebRTCSender : MonoBehaviour
 
         if (videoTrack == null || videoTrack.ReadyState != TrackState.Live)
         {
-
+            Debug.LogError("WebRTC: Video track never became live!");
             yield break;
         }
 
@@ -439,13 +422,19 @@ public class WebRTCSender : MonoBehaviour
         var setLocal = peerConnection.SetLocalDescription(ref offer);
         yield return setLocal;
 
-        SendWs(new {
-            type = "sendToGroup",
-            group = room,
-            dataType = "json",
-            data = new { type = "offer", room, sdp = offer.sdp }
-        });
-        //Debug.Log("Offer sent");
+        var offerMessage = new SendToGroupMessage<OfferMessageData>
+        {
+            Group = room,
+            Data = new OfferMessageData
+            {
+                Room = room,
+                Sdp = offer.sdp
+            }
+        };
+
+        socket.Send(offerMessage);
+
+        Debug.Log("Offer sent");
     }
 
     IEnumerator SetRemoteAnswer(string sdp)
@@ -453,32 +442,15 @@ public class WebRTCSender : MonoBehaviour
         var answer = new RTCSessionDescription { type = RTCSdpType.Answer, sdp = sdp };
         var op = peerConnection.SetRemoteDescription(ref answer);
         yield return op;
-        //Debug.Log("WebRTC connected!");
+        Debug.Log("WebRTC connected!");
     }
 
     void OnDestroy()
     {
-        // Notifying lobby that call is ended
-        if (ws != null && ws.State == WebSocketState.Open)
-        {
-            SendWs(new {
-                type     = "sendToGroup",
-                group    = "lobby",
-                dataType = "json",
-                data     = new { type = "call-ended", room }
-            });
-        }
-
         cts?.Cancel();
         videoTrack?.Dispose();
         peerConnection?.Close();
-        ws?.Dispose();
+        socket?.Dispose();
         if (_webRtcRenderTexture != null) Destroy(_webRtcRenderTexture);
-        if (LeftCameraRT  != null) Destroy(LeftCameraRT);
-        if (RightCameraRT != null) Destroy(RightCameraRT);
     }
 }
-
-[Serializable] class NegotiateResponse { public string url; }
-[Serializable] class IceConfigResponse { public IceServerData[] iceServers; }
-[Serializable] class IceServerData { public string[] urls; public string username; public string credential; }
