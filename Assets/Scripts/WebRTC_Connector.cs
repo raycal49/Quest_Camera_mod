@@ -38,13 +38,12 @@ public class WebRTCSender : MonoBehaviour
     private bool _trackReady = false;
 
     //private string signalingServerUrl = "https://ar-signaling-server.azurewebsites.net";
-    private SignalServer server = new SignalServer("https://ar-signaling-server.azurewebsites.net");
-    private string userId = "quest-user";
+    private AzureApiClient server = new AzureApiClient("https://ar-signaling-server.azurewebsites.net");
+    private string userId;
     private string room;
 
     //private ClientWebSocket ws;
     public Socket socket = new Socket();
-    private CancellationTokenSource cts = new CancellationTokenSource();
     private readonly ConcurrentQueue<string> messageQueue = new ConcurrentQueue<string>();
 
     void Awake()
@@ -225,7 +224,7 @@ public class WebRTCSender : MonoBehaviour
         RightCaptureCamera.fieldOfView = fovRight;
     }
 
-    // need to put this in its own controller
+    
     async Task ConnectWebSocket(string url)
     {
         socket.SetUrl(url);
@@ -233,53 +232,73 @@ public class WebRTCSender : MonoBehaviour
         await socket.ConnectWebSocket(url);
         Debug.Log("Connected to Web PubSub");
 
-        var joinGroup = new JoinGroupMessage { Group = room };
-
-        // Join room
-        await socket.Send(joinGroup);
+        await JoinGroup(room);
 
         await Task.Delay(2000);
 
-        // Send call request
+        await SendCallRequestToGroup(callerName, room);
+
+        // Start receiving which will enqueue a message and eventually Update() will call and execute HandleMessage, in which we hope to receive a message back
+        await socket.ReceiveLoop(messageQueue);
+    }
+
+    
+    async Task JoinGroup(string roomToJoin)
+    {
+        var joinGroup = new JoinGroupMessage { Group = roomToJoin };
+
+        // Join room
+        await socket.Send(joinGroup);
+    }
+
+    async Task SendCallRequestToGroup(string caller, string roomToJoin)
+    {
         var sendGroup = new SendToGroupMessage<CallRequestData>
         {
-            Group = room,
+            Group = "lobby", // this used to be lobby, for some reason
             Data = new CallRequestData
             {
-                Group = room,
-                CallerName = callerName 
-                
+                Room = room,
+                CallerName = caller
+
             }
         };
 
         await socket.Send(sendGroup);
-
-        // Start receiving
-        await socket.ReceiveLoop(messageQueue);
     }
 
+   
     void HandleMessage(string raw)
     {
-        Debug.Log("WebRTC WS <- " + raw);
+        Debug.Log("In HandleMessage, raw contains: " + raw);
 
-        var msg = JsonConvert.DeserializeObject<Dictionary<string, object>>(raw);
-        if (!msg.ContainsKey("data")) return;
+        var envelope = JsonConvert.DeserializeObject<WebPubSubEnvelope<SignalingMessage>>(raw);
+        if (envelope.Type != "message") return;          
+        if (envelope.Data == null) return;
 
-        var data = JsonConvert.DeserializeObject<Dictionary<string, object>>(
-            msg["data"].ToString());
+        // Optional: ignore your own echoed publishes (recommended)
+        if (envelope.FromUserId == userId) return;
 
-        if (!data.ContainsKey("type")) return;
-        var type = data["type"].ToString();
+        var data = envelope.Data;
+        Debug.Log("In HandleMessage, data contains: " + data);
 
-        // Only process messages intended for our room
-        if (data.ContainsKey("room") && data["room"]?.ToString() != room)
-            return;
+        var type = data.Type;
+        if (string.IsNullOrEmpty(type)) return;
+
+        Debug.Log("In HandleMessage, type contains: " + type);
+
+        var sdp = data.Sdp;
+
+        Debug.Log("In HandleMessage, Sdp contains " + sdp);
 
         switch (type)
         {
+            // we called SendCallRequestToGroup in ConnectWebSocket which sent a "call-request" type of message to see if someone wants to initiate webrtc peer-to-peer connection
+            // so the first case is someone sending back "call-accepted," indicating they wish to do webrtc with us so we send an offer to them
             case "call-accepted":
                 Debug.Log("Call accepted — sending offer");
                 StartCoroutine(SendOffer());
+                Debug.Log("In HandleMessage, case is call-accepted");
                 break;
 
             case "call-declined":
@@ -288,49 +307,47 @@ public class WebRTCSender : MonoBehaviour
                 break;
 
             case "answer":
-                StartCoroutine(SetRemoteAnswer(data["sdp"].ToString()));
+                StartCoroutine(SetRemoteAnswer(sdp));
+                Debug.Log("In HandleMessage, case is answer");
                 break;
 
             case "ice-candidate":
-                HandleIceCandidate(data);
+                HandleIceCandidate(data.Candidate);
+                Debug.Log("In HandleMessage, case is ice-candidate");
                 break;
         }
     }
 
-    void HandleIceCandidate(Dictionary<string, object> data)
+    
+    // the function itself is like 4 parts:
+    // 1.) checking to see if we have the right shape of data
+    // 2.) converting the incoming ice candidate into RTCIceCandidateInit
+    // 3.) Adding it to our peerConnection as a formal ice candidate
+    void HandleIceCandidate(IceCandidatePayload ice)
     {
         try
         {
-            if (!data.ContainsKey("candidate")) return;
-            
-            var candidateRaw = data["candidate"];
-            if (candidateRaw == null) return;
+            // we are working with the sub-object "data" which contains the keys "candidate", "sdpMid", and "sdpMLineIndex".
+            if (peerConnection == null) return;
+            if (ice == null) return;
 
-            var candidateObj = JsonConvert
-                .DeserializeObject<Dictionary<string, object>>(candidateRaw.ToString());
 
-            if (candidateObj == null) return;
-
-            var candidateStr = candidateObj.ContainsKey("candidate") ? candidateObj["candidate"]?.ToString() : "";
-            
-            // Empty candidate = end-of-candidates signal, safe to ignore
-            if (string.IsNullOrEmpty(candidateStr)) 
+            if (string.IsNullOrWhiteSpace(ice.Candidate))
             {
                 Debug.Log("WebRTC: End of candidates signal received, ignoring.");
                 return;
             }
 
-            var sdpMid = candidateObj.ContainsKey("sdpMid") ? candidateObj["sdpMid"]?.ToString() : "0";
-            var sdpMLineIndex = candidateObj.ContainsKey("sdpMLineIndex") ?
-                int.Parse(candidateObj["sdpMLineIndex"].ToString()) : 0;
-
-            var init = new RTCIceCandidateInit
+            // iceCandidate is actually of type RTCIceCandidateInit which is passed into constructor of RTCIceCandidate
+            // we probably could make a function to make initialization neater but, eh
+            var iceCandidate = new RTCIceCandidateInit
             {
-                candidate = candidateStr,
-                sdpMid = sdpMid ?? "0",
-                sdpMLineIndex = sdpMLineIndex
+                candidate = ice.Candidate,
+                sdpMid = ice.SdpMid ?? "0", // not sure if this should even be here
+                sdpMLineIndex = ice.SdpMLineIndex
             };
-            peerConnection.AddIceCandidate(new RTCIceCandidate(init));
+
+            peerConnection.AddIceCandidate(new RTCIceCandidate(iceCandidate));
             Debug.Log("WebRTC: ICE candidate added");
         }
         catch (Exception e)
@@ -364,7 +381,7 @@ public class WebRTCSender : MonoBehaviour
                 Group = room,
                 Data = new IceCandidateRequestData
                 {
-                    Group = room,
+                    Room = room,
                     Candidate = new IceCandidatePayload
                     {
                         Candidate = candidate.Candidate,
@@ -388,7 +405,7 @@ public class WebRTCSender : MonoBehaviour
                     Group = "lobby",
                     Data = new CallEndedData
                     {
-                        Group = room
+                        Room = room
                     }
                 });
             }
@@ -397,6 +414,7 @@ public class WebRTCSender : MonoBehaviour
         Debug.Log("WebRTC: Peer connection created");
     }
 
+    // im going to assume at the start of this we're checking to see if we even have video to send
     IEnumerator SendOffer()
     {
         float timeout = 10f;
@@ -414,7 +432,6 @@ public class WebRTCSender : MonoBehaviour
         }
 
         yield return new WaitForSeconds(0.5f);
-
 
         var op = peerConnection.CreateOffer();
         yield return op;
@@ -442,12 +459,13 @@ public class WebRTCSender : MonoBehaviour
         var answer = new RTCSessionDescription { type = RTCSdpType.Answer, sdp = sdp };
         var op = peerConnection.SetRemoteDescription(ref answer);
         yield return op;
-        Debug.Log("WebRTC connected!");
+
+        // WebRTC is not connected after this. If ICE connectivity stuff is done then yes but no guarantee it is at this point in the code
+        //Debug.Log("WebRTC connected!");
     }
 
     void OnDestroy()
     {
-        cts?.Cancel();
         videoTrack?.Dispose();
         peerConnection?.Close();
         socket?.Dispose();

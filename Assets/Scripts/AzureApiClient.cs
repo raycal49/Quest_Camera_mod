@@ -4,8 +4,8 @@ using Newtonsoft.Json;
 using UnityEngine;
 using UnityEngine.Networking;
 
-// technically, this doesnt need to derive from Monobehaviour despite it having a function that returns an IEnumerator but it still is dependent on Monobehaviour. yeah....
-public class SignalServer
+// this technically is derived from Monobehavior even if its not explicit
+public class AzureApiClient
 {
     private readonly string _serverUrl;
 
@@ -13,7 +13,7 @@ public class SignalServer
 
     public string NegotiateUrl;
 
-    public SignalServer(string serverUrl)
+    public AzureApiClient(string serverUrl)
     {
         _serverUrl = serverUrl;
     }
@@ -26,7 +26,7 @@ public class SignalServer
 
        yield return req.SendWebRequest();
 
-       // by having yield break we can leave here and have our field SignalServer.IceConfig just be empty so we need to account for this outside
+       // by having yield break we can leave here and have our field AzureApiClient.IceConfig just be empty so we need to account for this outside
        // could throw an exception but... eh...
        if (req.result != UnityWebRequest.Result.Success)
        {

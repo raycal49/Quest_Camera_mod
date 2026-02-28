@@ -69,6 +69,7 @@ public class Socket
 
     public void Dispose()
     {
+        _cts.Cancel();
         _socket.Dispose();
     }
 }

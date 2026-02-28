@@ -1,4 +1,5 @@
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using Unity.WebRTC;
 
 public class NegotiateResponse
@@ -25,8 +26,8 @@ public class IceServerData
     public string Credential { get; set; }
 }
 
-///
-/// 
+
+/// outgoing message dtos
 
 public class JoinGroupMessage
 {
@@ -57,8 +58,8 @@ public class CallRequestData
     [JsonProperty("type")]
     public string Type { get; set; } = "call-request";
 
-    [JsonProperty("group")]
-    public string Group { get; set; }
+    [JsonProperty("room")]
+    public string Room { get; set; }
 
     [JsonProperty("callerName")]
     public string CallerName { get; set; }
@@ -70,8 +71,8 @@ public class CallEndedData
     [JsonProperty("type")]
     public string Type { get; set; } = "call-ended";
 
-    [JsonProperty("group")]
-    public string Group { get; set; }
+    [JsonProperty("room")]
+    public string Room { get; set; }
 }
 
 public class OfferMessageData
@@ -91,11 +92,53 @@ public class IceCandidateRequestData
     [JsonProperty("type")]
     public string Type { get; set; } = "ice-candidate";
 
-    [JsonProperty("group")]
-    public string Group { get; set; }
+    [JsonProperty("room")]
+    public string Room { get; set; }
 
     [JsonProperty("candidate")]
     public IceCandidatePayload Candidate { get; set; }
+}
+
+
+// incoming message dtos
+
+public sealed class WebPubSubEnvelope<T>
+{
+    [JsonProperty("type")]
+    public string Type { get; set; } // "message", "system", "ack", ...
+
+    [JsonProperty("from")]
+    public string From { get; set; } // "group" or "server"
+
+    [JsonProperty("fromUserId")]
+    public string FromUserId { get; set; }
+
+    [JsonProperty("group")]
+    public string Group { get; set; }
+
+    [JsonProperty("dataType")]
+    public string DataType { get; set; } // "json"
+
+    [JsonProperty("data")]
+    public T Data { get; set; } // <-- your payload
+}
+
+public sealed class SignalingMessage
+{
+    [JsonProperty("type")]
+    public string Type { get; set; } // "call-accepted", "answer", ...
+
+    [JsonProperty("room")]
+    public string Room { get; set; }
+
+    [JsonProperty("callerName")]
+    public string CallerName { get; set; }
+
+    [JsonProperty("sdp")]
+    public string Sdp { get; set; } // offer/answer only
+
+    [JsonProperty("candidate")]
+    public IceCandidatePayload Candidate { get; set; } // ice-candidate only
 }
 
 public class IceCandidatePayload
