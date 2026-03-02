@@ -3,17 +3,11 @@ using System;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Net.WebSockets;
-using System.Text;
-using System.Text.RegularExpressions;
-using System.Threading;
 using System.Threading.Tasks;
 using Unity.WebRTC;
 using UnityEngine;
 using UnityEngine.Android;
 using UnityEngine.Experimental.Rendering;
-using UnityEngine.Networking;
-using Newtonsoft.Json;
 
 public class WebRTCSender : MonoBehaviour
 {
@@ -33,7 +27,8 @@ public class WebRTCSender : MonoBehaviour
 
     private string callerName = "Meta Quest User";
 
-    private RTCPeerConnection peerConnection;
+    private WebRtcPeerConnectionClient peerConnectionClient;
+    private WebRtcController sessionController;
     private VideoStreamTrack videoTrack;
     private bool _trackReady = false;
 
@@ -66,9 +61,31 @@ public class WebRTCSender : MonoBehaviour
     {
         while (messageQueue.TryDequeue(out string message))
         {
-            HandleMessage(message);
+            //HandleMessage(message);
+
+            if (sessionController == null)
+            {
+                break;
+            }
+
+            sessionController.HandleIncomingMessage(message);
         }
     }
+
+    void OnSessionCoroutineRequested(IEnumerator coroutine)
+    {
+        StartCoroutine(coroutine);
+    }
+
+    //void HandleMessage(string message)
+    //{
+    //    if (sessionController == null)
+    //    {
+    //        return;
+    //    }
+
+    //    sessionController.HandleIncomingMessage(message);
+    //}
 
     IEnumerator RequestPermissionThenInit()
     {
@@ -115,7 +132,12 @@ public class WebRTCSender : MonoBehaviour
 
         Debug.Log("WebRTC: Negotiate OK");
 
-        SetupPeerConnection(iceConfig);
+        peerConnectionClient = new WebRtcPeerConnectionClient();
+        peerConnectionClient.SetupPeerConnection(iceConfig);
+
+        sessionController = new WebRtcController(userId, room, socket, peerConnectionClient);
+        sessionController.CoroutineRequested += OnSessionCoroutineRequested;
+        sessionController.BindPeerEvents();
 
         yield return StartCoroutine(SetupVideoTrack());
 
@@ -168,7 +190,10 @@ public class WebRTCSender : MonoBehaviour
         _stereoBlendMaterial = new Material(shader);
 
         videoTrack = new VideoStreamTrack(_webRtcRenderTexture);
-        peerConnection.AddTrack(videoTrack);
+
+        // why do we have AddTrack and SetVideoTrack, each on two different classes?
+        peerConnectionClient.AddTrack(videoTrack);
+        sessionController.SetVideoTrack(videoTrack);
 
         _trackReady = true;
         StartCoroutine(CompositorLoop());
@@ -232,243 +257,27 @@ public class WebRTCSender : MonoBehaviour
         await socket.ConnectWebSocket(url);
         Debug.Log("Connected to Web PubSub");
 
-        await JoinGroup(room);
+        await sessionController.JoinRoom();
 
         await Task.Delay(2000);
 
-        await SendCallRequestToGroup(callerName, room);
+        await sessionController.SendCallRequest(callerName);
 
-        // Start receiving which will enqueue a message and eventually Update() will call and execute HandleMessage, in which we hope to receive a message back
+        // Start receiving which will enqueue a message and eventually Update() will call and execute HandleMessage then we hope to receive a message back
         await socket.ReceiveLoop(messageQueue);
-    }
-
-    
-    async Task JoinGroup(string roomToJoin)
-    {
-        var joinGroup = new JoinGroupMessage { Group = roomToJoin };
-
-        // Join room
-        await socket.Send(joinGroup);
-    }
-
-    async Task SendCallRequestToGroup(string caller, string roomToJoin)
-    {
-        var sendGroup = new SendToGroupMessage<CallRequestData>
-        {
-            Group = "lobby", // this used to be lobby, for some reason
-            Data = new CallRequestData
-            {
-                Room = room,
-                CallerName = caller
-
-            }
-        };
-
-        await socket.Send(sendGroup);
-    }
-
-   
-    void HandleMessage(string raw)
-    {
-        Debug.Log("In HandleMessage, raw contains: " + raw);
-
-        var envelope = JsonConvert.DeserializeObject<WebPubSubEnvelope<SignalingMessage>>(raw);
-        if (envelope.Type != "message") return;          
-        if (envelope.Data == null) return;
-
-        // Optional: ignore your own echoed publishes (recommended)
-        if (envelope.FromUserId == userId) return;
-
-        var data = envelope.Data;
-        Debug.Log("In HandleMessage, data contains: " + data);
-
-        var type = data.Type;
-        if (string.IsNullOrEmpty(type)) return;
-
-        Debug.Log("In HandleMessage, type contains: " + type);
-
-        var sdp = data.Sdp;
-
-        Debug.Log("In HandleMessage, Sdp contains " + sdp);
-
-        switch (type)
-        {
-            // we called SendCallRequestToGroup in ConnectWebSocket which sent a "call-request" type of message to see if someone wants to initiate webrtc peer-to-peer connection
-            // so the first case is someone sending back "call-accepted," indicating they wish to do webrtc with us so we send an offer to them
-            case "call-accepted":
-                Debug.Log("Call accepted — sending offer");
-                StartCoroutine(SendOffer());
-                Debug.Log("In HandleMessage, case is call-accepted");
-                break;
-
-            case "call-declined":
-                Debug.Log("WebRTC: Call declined by web client");
-                // Optionally: re-broadcast to lobby after a delay so other web clients can answer
-                break;
-
-            case "answer":
-                StartCoroutine(SetRemoteAnswer(sdp));
-                Debug.Log("In HandleMessage, case is answer");
-                break;
-
-            case "ice-candidate":
-                HandleIceCandidate(data.Candidate);
-                Debug.Log("In HandleMessage, case is ice-candidate");
-                break;
-        }
-    }
-
-    
-    // the function itself is like 4 parts:
-    // 1.) checking to see if we have the right shape of data
-    // 2.) converting the incoming ice candidate into RTCIceCandidateInit
-    // 3.) Adding it to our peerConnection as a formal ice candidate
-    void HandleIceCandidate(IceCandidatePayload ice)
-    {
-        try
-        {
-            // we are working with the sub-object "data" which contains the keys "candidate", "sdpMid", and "sdpMLineIndex".
-            if (peerConnection == null) return;
-            if (ice == null) return;
-
-
-            if (string.IsNullOrWhiteSpace(ice.Candidate))
-            {
-                Debug.Log("WebRTC: End of candidates signal received, ignoring.");
-                return;
-            }
-
-            // iceCandidate is actually of type RTCIceCandidateInit which is passed into constructor of RTCIceCandidate
-            // we probably could make a function to make initialization neater but, eh
-            var iceCandidate = new RTCIceCandidateInit
-            {
-                candidate = ice.Candidate,
-                sdpMid = ice.SdpMid ?? "0", // not sure if this should even be here
-                sdpMLineIndex = ice.SdpMLineIndex
-            };
-
-            peerConnection.AddIceCandidate(new RTCIceCandidate(iceCandidate));
-            Debug.Log("WebRTC: ICE candidate added");
-        }
-        catch (Exception e)
-        {
-            Debug.LogError("WebRTC: ICE candidate error: " + e.Message);
-        }
-    }
-
-    // this is only initialized AFTER we have an IceConfig file
-    void SetupPeerConnection(IceConfig iceConfig)
-    {
-        var iceServers = new List<RTCIceServer>();
-        foreach (var s in iceConfig.IceServers)
-            iceServers.Add(new RTCIceServer
-            {
-                urls = s.Urls,
-                username = s.Username,
-                credential = s.Credential
-            });
-
-        var config = new RTCConfiguration { iceServers = iceServers.ToArray() };
-
-        peerConnection = new RTCPeerConnection(ref config);
-
-        peerConnection.OnIceCandidate = candidate =>
-        {
-            if (string.IsNullOrEmpty(candidate.Candidate)) return;
-
-            var message = new SendToGroupMessage<IceCandidateRequestData>
-            {
-                Group = room,
-                Data = new IceCandidateRequestData
-                {
-                    Room = room,
-                    Candidate = new IceCandidatePayload
-                    {
-                        Candidate = candidate.Candidate,
-                        SdpMid = candidate.SdpMid,
-                        SdpMLineIndex = candidate.SdpMLineIndex ?? 0
-                    }
-                }
-            };
-
-            socket.Send(message);
-        };
-
-        peerConnection.OnIceConnectionChange = state => Debug.Log($"WebRTC ICE: {state}");
-        peerConnection.OnConnectionStateChange = state =>
-        {
-            Debug.Log($"WebRTC Connection: {state}");
-            if (state == RTCPeerConnectionState.Disconnected || state == RTCPeerConnectionState.Failed)
-            {
-                socket.Send(new SendToGroupMessage<CallEndedData>
-                {
-                    Group = "lobby",
-                    Data = new CallEndedData
-                    {
-                        Room = room
-                    }
-                });
-            }
-        };
-
-        Debug.Log("WebRTC: Peer connection created");
-    }
-
-    // im going to assume at the start of this we're checking to see if we even have video to send
-    IEnumerator SendOffer()
-    {
-        float timeout = 10f;
-        float elapsed = 0f;
-        while ((videoTrack == null || videoTrack.ReadyState != TrackState.Live) && elapsed < timeout)
-        {
-            yield return new WaitForSeconds(0.2f);
-            elapsed += 0.2f;
-        }
-
-        if (videoTrack == null || videoTrack.ReadyState != TrackState.Live)
-        {
-            Debug.LogError("WebRTC: Video track never became live!");
-            yield break;
-        }
-
-        yield return new WaitForSeconds(0.5f);
-
-        var op = peerConnection.CreateOffer();
-        yield return op;
-        var offer = op.Desc;
-        var setLocal = peerConnection.SetLocalDescription(ref offer);
-        yield return setLocal;
-
-        var offerMessage = new SendToGroupMessage<OfferMessageData>
-        {
-            Group = room,
-            Data = new OfferMessageData
-            {
-                Room = room,
-                Sdp = offer.sdp
-            }
-        };
-
-        socket.Send(offerMessage);
-
-        Debug.Log("Offer sent");
-    }
-
-    IEnumerator SetRemoteAnswer(string sdp)
-    {
-        var answer = new RTCSessionDescription { type = RTCSdpType.Answer, sdp = sdp };
-        var op = peerConnection.SetRemoteDescription(ref answer);
-        yield return op;
-
-        // WebRTC is not connected after this. If ICE connectivity stuff is done then yes but no guarantee it is at this point in the code
-        //Debug.Log("WebRTC connected!");
     }
 
     void OnDestroy()
     {
         videoTrack?.Dispose();
-        peerConnection?.Close();
         socket?.Dispose();
+
+        if (sessionController != null)
+        {
+            sessionController.CoroutineRequested -= OnSessionCoroutineRequested;
+            sessionController.UnbindPeerEvents();
+        }
+
         if (_webRtcRenderTexture != null) Destroy(_webRtcRenderTexture);
     }
 }
