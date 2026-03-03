@@ -40,6 +40,7 @@ public class WebRTCSender : MonoBehaviour
     //private ClientWebSocket ws;
     public Socket socket = new Socket();
     private readonly ConcurrentQueue<string> messageQueue = new ConcurrentQueue<string>();
+    private bool _loggedMissingSessionController = false;
 
     void Awake()
     {
@@ -59,15 +60,13 @@ public class WebRTCSender : MonoBehaviour
 
     void Update()
     {
+        if (sessionController == null)
+        {
+            return;
+        }
+
         while (messageQueue.TryDequeue(out string message))
         {
-            //HandleMessage(message);
-
-            if (sessionController == null)
-            {
-                break;
-            }
-
             sessionController.HandleIncomingMessage(message);
         }
     }
@@ -76,16 +75,6 @@ public class WebRTCSender : MonoBehaviour
     {
         StartCoroutine(coroutine);
     }
-
-    //void HandleMessage(string message)
-    //{
-    //    if (sessionController == null)
-    //    {
-    //        return;
-    //    }
-
-    //    sessionController.HandleIncomingMessage(message);
-    //}
 
     IEnumerator RequestPermissionThenInit()
     {

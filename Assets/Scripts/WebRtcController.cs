@@ -72,6 +72,7 @@ public class WebRtcController
 
     public void HandleIncomingMessage(string raw)
     {
+        Debug.Log("Message passed through contains: " + raw);
         var envelope = JsonConvert.DeserializeObject<WebPubSubEnvelope<SignalingMessage>>(raw);
         if (envelope == null || envelope.Type != "message" || envelope.Data == null)
         {
@@ -101,19 +102,22 @@ public class WebRtcController
         switch (type)
         {
             case "call-accepted":
+                Debug.Log("case: call-accepted");
                 RequestCoroutine(_peerConnectionClient.SendOffer(_videoTrack));
                 break;
 
             case "answer":
+                Debug.Log("case: answer");
                 RequestCoroutine(_peerConnectionClient.SetRemoteAnswer(sdp));
                 break;
 
             case "ice-candidate":
+                Debug.Log("case: ice-candidate");
                 _peerConnectionClient.HandleIceCandidate(data.Candidate);
                 break;
 
             case "call-declined":
-                //Debug.Log("WebRTC: Call declined by web client");
+                Debug.Log("WebRTC: Call declined by web client");
                 break;
         }
     }
